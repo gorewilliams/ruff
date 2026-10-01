@@ -11,14 +11,15 @@ mod tests {
     use std::path::Path;
 
     use anyhow::Result;
-    use ruff_python_ast::PythonVersion;
+    use ruff_python_ast::{PySourceType, PythonVersion};
     use ruff_python_semantic::{MemberNameImport, NameImport};
     use test_case::test_case;
 
     use crate::registry::Rule;
     use crate::rules::{isort, pyupgrade};
     use crate::settings::types::PreviewMode;
-    use crate::test::{test_path, test_snippet};
+    use crate::source_kind::SourceKind;
+    use crate::test::{test_contents, test_path, test_snippet};
     use crate::{assert_diagnostics, assert_diagnostics_diff, settings};
 
     #[test_case(Rule::ConvertNamedTupleFunctionalToClass, Path::new("UP014.py"))]
@@ -126,6 +127,120 @@ mod tests {
         )?;
         assert_diagnostics!(snapshot, diagnostics);
         Ok(())
+    }
+
+    #[test_case(PythonVersion::PY312, PySourceType::Python, false)]
+    #[test_case(PythonVersion::PY312, PySourceType::Python, true)]
+    #[test_case(PythonVersion::PY312, PySourceType::Stub, false)]
+    #[test_case(PythonVersion::PY314, PySourceType::Python, false)]
+    fn private_type_parameter_shadowing(
+        target_version: PythonVersion,
+        source_type: PySourceType,
+        future_annotations: bool,
+    ) {
+        let preamble = if future_annotations {
+            "from __future__ import annotations\n"
+        } else {
+            ""
+        };
+        let source = SourceKind::Python {
+            code: format!(
+                "{preamble}\
+from typing import Callable, ParamSpec, TypeVar, TypeVarTuple
+
+_T = TypeVar(\"_T\")
+_U = TypeVar(\"_U\")
+_P = ParamSpec(\"_P\")
+_Ts = TypeVarTuple(\"_Ts\")
+
+def legacy(x: _T) -> _T: ...
+
+def generic[_T](x: _T) -> _T: ...
+
+def quoted[_T](x: \"_T\") -> \"_T\": ...
+
+class Generic[_T]:
+    value: _T
+
+    def method(self, x: _T) -> _T:
+        def nested(y: _T) -> _T: ...
+        return nested(x)
+
+def variadic[*_Ts](x: tuple[*_Ts]) -> tuple[*_Ts]: ...
+
+def paramspec[**_P](x: Callable[_P, int]) -> Callable[_P, int]: ...
+
+def dependent[_T, _U: _T = _T](x: _U) -> _T: ...
+
+class Shadowed[_T]:
+    _T = int
+    value: _T
+
+def local_shadow[_T]():
+    _T = int
+    value: _T
+
+module_value: _T
+"
+            ),
+            is_stub: source_type.is_stub(),
+        };
+        let path = if source_type.is_stub() {
+            Path::new("example.pyi")
+        } else {
+            Path::new("example.py")
+        };
+        let (_, transformed) = test_contents(
+            &source,
+            path,
+            &settings::LinterSettings::for_rules([
+                Rule::NonPEP695GenericFunction,
+                Rule::PrivateTypeParameter,
+            ])
+            .with_target_version(target_version),
+        );
+        assert_eq!(
+            transformed.source_code(),
+            format!(
+                "{preamble}\
+from typing import Callable, ParamSpec, TypeVar, TypeVarTuple
+
+_T = TypeVar(\"_T\")
+_U = TypeVar(\"_U\")
+_P = ParamSpec(\"_P\")
+_Ts = TypeVarTuple(\"_Ts\")
+
+def legacy[T](x: T) -> T: ...
+
+def generic[T](x: T) -> T: ...
+
+def quoted[T](x: \"T\") -> \"T\": ...
+
+class Generic[T]:
+    value: T
+
+    def method(self, x: T) -> T:
+        def nested(y: T) -> T: ...
+        return nested(x)
+
+def variadic[*Ts](x: tuple[*Ts]) -> tuple[*Ts]: ...
+
+def paramspec[**P](x: Callable[P, int]) -> Callable[P, int]: ...
+
+def dependent[T, U: T = T](x: U) -> T: ...
+
+class Shadowed[T]:
+    _T = int
+    value: _T
+
+def local_shadow[T]():
+    _T = int
+    value: _T
+
+module_value: _T
+"
+            )
+        );
     }
 
     #[test_case(PythonVersion::PY37)]
