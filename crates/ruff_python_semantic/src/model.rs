@@ -489,38 +489,37 @@ impl<'a> SemanticModel<'a> {
     /// Resolve a `load` reference to an [`ast::ExprName`].
     pub fn resolve_load(&mut self, name: &'a ast::ExprName) -> ReadResult {
         // PEP 563 indicates that if a forward reference can be resolved in the module scope, we
-        // should prefer it over local resolutions.
-        if self.in_forward_reference() {
-            if let Some(binding_id) = self.scopes.global().get(name.id.as_str()) {
-                if !self.bindings[binding_id].is_unbound() {
-                    // Mark the binding as used.
-                    let reference_id = self.resolved_references.push(
-                        ScopeId::global(),
-                        self.node_id,
-                        ExprContext::Load,
-                        self.flags,
-                        name.range,
-                    );
-                    self.bindings[binding_id].references.push(reference_id);
+        // should prefer it over local resolutions, except for PEP 695 type parameter scopes.
+        if self.in_forward_reference()
+            && let Some(binding_id) =
+                self.lookup_global_for_forward_reference(name.id.as_str(), self.scope_id)
+        {
+            // Mark the binding as used.
+            let reference_id = self.resolved_references.push(
+                ScopeId::global(),
+                self.node_id,
+                ExprContext::Load,
+                self.flags,
+                name.range,
+            );
+            self.bindings[binding_id].references.push(reference_id);
 
-                    // Mark any submodule aliases as used.
-                    if let Some(binding_id) =
-                        self.resolve_submodule(name.id.as_str(), ScopeId::global(), binding_id)
-                    {
-                        let reference_id = self.resolved_references.push(
-                            ScopeId::global(),
-                            self.node_id,
-                            ExprContext::Load,
-                            self.flags,
-                            name.range,
-                        );
-                        self.bindings[binding_id].references.push(reference_id);
-                    }
-
-                    self.resolved_names.insert(name.into(), binding_id);
-                    return ReadResult::Resolved(binding_id);
-                }
+            // Mark any submodule aliases as used.
+            if let Some(binding_id) =
+                self.resolve_submodule(name.id.as_str(), ScopeId::global(), binding_id)
+            {
+                let reference_id = self.resolved_references.push(
+                    ScopeId::global(),
+                    self.node_id,
+                    ExprContext::Load,
+                    self.flags,
+                    name.range,
+                );
+                self.bindings[binding_id].references.push(reference_id);
             }
+
+            self.resolved_names.insert(name.into(), binding_id);
+            return ReadResult::Resolved(binding_id);
         }
 
         let mut import_starred = false;
@@ -820,6 +819,31 @@ impl<'a> SemanticModel<'a> {
         }
     }
 
+    /// Return the module binding preferred for a forward reference, if any.
+    fn lookup_global_for_forward_reference(
+        &self,
+        symbol: &str,
+        scope_id: ScopeId,
+    ) -> Option<BindingId> {
+        let binding_id = self.scopes.global().get(symbol)?;
+        if self.bindings[binding_id].is_unbound() {
+            return None;
+        }
+
+        // Type parameters shadow module bindings even in stringified annotations. Fall back to
+        // lexical lookup so that nearer local bindings can still shadow the type parameter.
+        if self.scopes.ancestors(scope_id).any(|scope| {
+            scope.kind.is_type()
+                && scope
+                    .get(symbol)
+                    .is_some_and(|binding_id| self.bindings[binding_id].kind.is_type_param())
+        }) {
+            return None;
+        }
+
+        Some(binding_id)
+    }
+
     /// Lookup a symbol in the current scope without materializing lazy builtins.
     pub fn lookup_symbol(&self, symbol: &str) -> Symbol {
         self.lookup_symbol_in_scope(symbol, self.scope_id, self.in_forward_reference())
@@ -866,12 +890,10 @@ impl<'a> SemanticModel<'a> {
         scope_id: ScopeId,
         in_forward_reference: bool,
     ) -> Symbol {
-        if in_forward_reference {
-            if let Some(binding_id) = self.scopes.global().get(symbol) {
-                if !self.bindings[binding_id].is_unbound() {
-                    return Symbol::Binding(binding_id);
-                }
-            }
+        if in_forward_reference
+            && let Some(binding_id) = self.lookup_global_for_forward_reference(symbol, scope_id)
+        {
+            return Symbol::Binding(binding_id);
         }
 
         let mut class_variables_visible = true;
